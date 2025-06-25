@@ -1,0 +1,213 @@
+import os
+import cv2
+import torch
+import numpy as np
+from PIL import Image
+from ultralytics import FastSAM
+import clip
+
+# ------------------------------ Configuration ------------------------------
+class COMPASSConfig:
+    # initalization
+    IMG_FOLDER_PATH = './ExampleImgs'
+    FASTSAM_WEIGHTS = "FastSAM-s.pt"
+    CLIP_MODEL = "ViT-B/32"
+    
+    # image processing
+    IMG_RESIZE = 512    # resize input image size
+    SAM_CONF = 0.1      # confidence threshold for FastSAM
+    SAM_IOU = 0.1       # IoU threshold for Fast SAM
+    CLIP_CONF = 0       # confidence threshold for CLIP
+
+    # display
+    MASK_ALPHA = 0.5                # opacity of masks
+    DISPLAY_CONTOURS = True         # display contours else display masks
+    DISPLAY_LABELS = True           # display labels else do not
+    DISPLAY_SUBCATEGORIES = False   # display sub categories else main ones
+    MOUSE_HOVER_MODE = False         # activate mouse hover mode else do not
+
+
+# ------------------------------ Pipeline ------------------------------
+class COMPASSPipeline:
+    # ---------------------------- Initialization ----------------------------
+    # initialize variables, models, and dictionary
+    def __init__(self, config):
+        # device and models
+        self.config = config
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.fastsam_model = FastSAM(config.FASTSAM_WEIGHTS)
+        self.clip_model, self.clip_preprocess = clip.load(config.CLIP_MODEL, device=self.device)
+
+        # categories and colors are loaded from a config file
+        from compass_wordbank import categories_dict, categories, category_colors
+        self.categories_dict = categories_dict
+        self.categories = categories
+        self.category_colors = category_colors
+
+        # mouse interaction
+        self.cursor_pos = (-1, -1)
+
+    # ---------------------------- Image Input ----------------------------
+    # read in images given a folder path
+    def load_images(self):
+        image_paths = [os.path.join(self.config.IMG_FOLDER_PATH, f) for f in os.listdir(self.config.IMG_FOLDER_PATH) if f.endswith('.png')]
+        return [cv2.imread(p) for p in image_paths]
+
+    # ---------------------------- Image Processing ----------------------------
+    # apply FastSAM model
+    def run_segmentation(self, image):
+        results = self.fastsam_model(
+            image,
+            device=self.device,
+            retina_masks=True,
+            imgsz=image.shape[:2],
+            conf=self.config.SAM_CONF,
+            iou=self.config.SAM_IOU,
+        )
+        return results[0].masks.data
+
+    # apply CLIP model
+    def run_text_association(self, image, masks):
+        # prepare CLIP text embeddings for categories
+        text_inputs = torch.cat([clip.tokenize(f"a photo of {category}") for category in self.categories]).to(self.device)
+        with torch.no_grad():
+            text_features = self.clip_model.encode_text(text_inputs)
+            text_features /= text_features.norm(dim=-1, keepdim=True)
+
+        # create array to store info about each mask
+        mask_info_list = []
+        # loop through each mask segment
+        for mask in masks:
+            mask_np = mask.cpu().numpy().astype(np.uint8) * 255
+
+            # convert segments into bounding boxes
+            x, y, w, h = cv2.boundingRect(mask_np)
+            cropped = image[y:y+h, x:x+w]
+
+             # skip empty or very small crops
+            if cropped.size == 0 or w < 10 or h < 10:
+                continue
+
+            # convert to PIL image for CLIP
+            pil_crop = Image.fromarray(cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB))
+            image_input = self.clip_preprocess(pil_crop).unsqueeze(0).to(self.device)
+
+            # calculate best score
+            with torch.no_grad():
+                image_features = self.clip_model.encode_image(image_input)
+                image_features /= image_features.norm(dim=-1, keepdim=True)
+                similarity = (100.0 * image_features @ text_features.T).softmax(dim=-1)
+                best_idx = similarity[0].argmax().item()
+                best_score = similarity[0][best_idx].item()
+
+            if best_score >= self.config.CLIP_CONF:
+                contours, _ = cv2.findContours(mask_np, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                best_label = self.categories[best_idx]
+                main_category = next((key for key, values in self.categories_dict.items() if best_label in values), best_label)
+                color = self.category_colors.get(main_category, (255, 255, 255))
+
+                mask_info_list.append({
+                    'mask': mask_np,
+                    'contours': contours,
+                    'bbox': (x, y, w, h),
+                    'label': best_label,
+                    'main_category': main_category,
+                    'score': best_score,
+                    'color': color
+                })
+
+        return mask_info_list
+
+    # ---------------------------- Display ----------------------------
+    # helper function to display one mask with text
+    # info is the unit from mask_info_list
+    def display_mask(self, info, display_img):
+        # grab data from mask_info_list
+        mask_np = info['mask']
+        color = info['color']
+        label = info['label'] if self.config.DISPLAY_SUBCATEGORIES else info['main_category']
+        score = info['score']
+
+        # display contours or masks
+        if self.config.DISPLAY_CONTOURS:
+            cv2.drawContours(display_img, info['contours'], -1, color, 2)
+        else:
+            display_img[mask_np > 0] = (
+                display_img[mask_np > 0] * (1 - self.config.MASK_ALPHA) + np.array(color, dtype=np.float32) * self.config.MASK_ALPHA
+            ).astype(np.uint8)
+
+        # Draw label at center of mask bounding box
+        if self.config.DISPLAY_LABELS:
+            x, y, w, h = info['bbox']
+            text_x = x + w // 2
+            text_y = y + h // 2
+            cv2.putText(display_img, f'{label} ({score:.2f})', (text_x, text_y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3)
+            cv2.putText(display_img, f'{label} ({score:.2f})', (text_x, text_y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+
+        return display_img
+
+    # mouse interaction
+    def on_mouse(self, event, x, y, flags, param):
+        if event == cv2.EVENT_MOUSEMOVE:
+            self.cursor_pos = (x, y)
+
+    # overall display function
+    def display_results(self, image, mask_info_list):
+        img_copy = image.copy()
+
+        # set up mouse interaction
+        if self.config.MOUSE_HOVER_MODE:
+            cv2.namedWindow("Interactive View")
+            cv2.setMouseCallback("Interactive View", self.on_mouse)
+            
+            while True:
+                # reset display_img
+                display_img = img_copy.copy()
+
+                # check if cursor is within image bounds and over non-zero mask pixel
+                hovered_info = next((info for info in mask_info_list if
+                                     0 <= self.cursor_pos[0] < info['mask'].shape[1] and
+                                     0 <= self.cursor_pos[1] < info['mask'].shape[0] and
+                                     info['mask'][self.cursor_pos[1], self.cursor_pos[0]] > 0), None)
+                
+                # if cursor is over a mask, only display that mask
+                # if cursor is over no mask, display all masks
+                if hovered_info:
+                    display_img = self.display_mask(hovered_info, display_img)
+                else:
+                    for info in mask_info_list:
+                        display_img = self.display_mask(info, display_img)
+
+                cv2.imshow("Interactive View", display_img)
+                key = cv2.waitKey(1)
+                if key != -1:
+                    break
+            cv2.destroyAllWindows()
+        else:
+            # reset display_img
+            display_img = img_copy.copy()
+            for info in mask_info_list:
+                display_img = self.display_mask(info, display_img)
+
+            cv2.imshow("Static View", display_img)
+            cv2.waitKey(0)
+            cv2.destroyAllWindows()
+
+    # ---------------------------- Execution ----------------------------
+    # run full pipeline
+    def run(self):
+        images = self.load_images()
+        for image in images:
+            image = cv2.resize(image, (self.config.IMG_RESIZE, self.config.IMG_RESIZE))
+            masks = self.run_segmentation(image)
+            mask_info_list = self.run_text_association(image, masks)
+            self.display_results(image, mask_info_list)
+
+
+# ------------------------------ Main ------------------------------
+if __name__ == "__main__":
+    config = COMPASSConfig()
+    pipeline = COMPASSPipeline(config)
+    pipeline.run()

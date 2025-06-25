@@ -1,0 +1,152 @@
+import os
+import cv2
+import torch
+import clip
+import numpy as np
+from PIL import Image
+from ultralytics import YOLO, FastSAM
+if __name__ == '__main__':
+    folder_path = './ExampleImgs'  # Replace with your actual path
+    image_paths = [os.path.join(folder_path, f) for f in os.listdir(folder_path) if f.endswith('.png')]
+    bgr_imgs = [cv2.imread(p) for p in image_paths]
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    # Load models
+    fastsam_model = FastSAM("FastSAM-s.pt")
+    yolo_model = YOLO("yolov8x-seg.pt")
+    clip_model, clip_preprocess = clip.load("ViT-B/32", device=device)
+    confidence_threshold = 0  # YOLO confidence threshold (not used in combined CLIP)
+    clip_conf_threshold = 0    # CLIP threshold for showing label
+    # Define categories for water, land, and objects
+    categories = ['Water', 'Ocean', 'Sea', 'Wave', 'River', 'Lake', 'Pond', 'Stream', 'Reflection Water', 'Water Surface', 'Ripples', 'Current', 'Waterfall', 'Foam', 'Splash', 'Tide', 'Shoreline', 'Lagoon', 'Estuary', 'Harbor', 'Bay', 'Cove', 'Glacier Water', 'Wetland', 'Marsh', 'Swamp', 'Reservoir', 'Aquatic',
+                'Vegetation',
+                'Tree', 'Palm Tree', 'Oak Tree', 'Pine Tree', 'Cypress', 'Trunk', 'Leaves', 'Branches',
+                'Bush', 'Shrub',
+                'Boat', 'Ship', 'Yacht', 'Sailboat', 'Pontoon', 'Fishing Boat', 'Kayak', 'Canoe', 'Dinghy',
+                'Boat parts', 'Motor', 'Mast', 'Hull', 'Propeller',
+                'Rock', 'Boulder', 'Stone',
+                'Sand', 'Beach',
+                'Grass', 'Weeds', 'Field',
+                'Dock', 'Pier', 'Jettie', 'Wharf',
+                'Pole', 'Piling',
+                'Tire', 'Wheel',
+                'Street', 'Sidewalk', 'Trail',
+                'Boat Ramp',
+                'Shoreline Barrier', 'Bulkhead', 'Sea Wall', 'Wall', 'Barrier', 'Fence',
+                'Bridge',
+                'Bouy',
+                'Building', 'Structure', 'House', 'Shed', 'Cabin',
+                'Lighthouse']
+    # Define categories for water, land, and objects
+    categories_dict = {
+        'Water': ['Ocean', 'Sea', 'Wave', 'River', 'Lake', 'Pond', 'Stream', 'Reflection Water', 'Water Surface', 'Ripples', 'Current', 'Waterfall', 'Foam', 'Splash', 'Tide', 'Shoreline', 'Lagoon', 'Estuary', 'Harbor', 'Bay', 'Cove', 'Glacier Water', 'Wetland', 'Marsh', 'Swamp', 'Reservoir', 'Aquatic'],
+        'Vegetation': ['Tree', 'Palm Tree', 'Oak Tree', 'Pine Tree', 'Cypress', 'Trunk', 'Leaves', 'Branches', 'Bush', 'Shrub'],
+        'Boat': ['Ship', 'Yacht', 'Sailboat', 'Pontoon', 'Fishing Boat', 'Kayak', 'Canoe', 'Dinghy'],
+        'Boat parts': ['Motor', 'Mast', 'Hull', 'Propeller'],
+        'Rock': ['Boulder', 'Stone'],
+        'Sand': ['Beach'],
+        'Grass': ['Weeds', 'Field'],
+        'Dock': ['Pier', 'Jettie', 'Wharf'],
+        'Pole': ['Piling'],
+        'Tire': ['Wheel'],
+        'Street': ['Sidewalk', 'Trail'],
+        'Boat Ramp': [],
+        'Shoreline Barrier': ['Bulkhead', 'Sea Wall', 'Wall', 'Barrier', 'Fence'],
+        'Bridge': [],
+        'Bouy': [],
+        'Building': ['Structure', 'House', 'Shed', 'Cabin'],
+        'Lighthouse': []
+    }
+    for img_idx, bgr_img in enumerate(bgr_imgs):
+        bgr_img = cv2.resize(bgr_img, (640, 640))
+        img_combined = bgr_img.copy()  # This will be used for combined view with CLIP
+        # ------------------- FastSAM Segmentation -------------------
+        fastsam_results = fastsam_model(
+            bgr_img,
+            device=device,
+            retina_masks=True,
+            imgsz=bgr_img.shape[:2],
+            conf=0.3,
+            iou=0.9,
+        )
+        # Prepare CLIP text embeddings for "water", "land", and "object"
+        text_inputs = torch.cat([clip.tokenize(f"a photo of {category}") for category in categories]).to(device)
+        with torch.no_grad():
+            text_features = clip_model.encode_text(text_inputs)
+            text_features /= text_features.norm(dim=-1, keepdim=True)
+        # Predefine colors for each main category
+        category_colors = {
+            'Water': (173, 216, 230),  # Light Blue (represents water)
+            'Vegetation': (144, 238, 144),  # Light Green (represents plants/vegetation)
+            'Boat': (135, 206, 250),  # Sky Blue (represents boats on water)
+            'Boat parts': (255, 255, 153),  # Light Yellow (neutral for parts)
+            'Rock': (211, 211, 211),  # Light Gray (represents rocks)
+            'Sand': (255, 228, 181),  # Moccasin (represents sand)
+            'Grass': (152, 251, 152),  # Pale Green (represents grass)
+            'Dock': (216, 191, 216),  # Thistle (neutral for docks)
+            'Pole': (224, 255, 255),  # Light Cyan (neutral for poles)
+            'Tire': (255, 182, 193),  # Light Pink (neutral for tires)
+            'Street': (210, 180, 140),  # Tan (represents streets/sidewalks)
+            'Boat Ramp': (176, 224, 230),  # Powder Blue (neutral for ramps)
+            'Shoreline Barrier': (169, 169, 169),  # Dark Gray (represents barriers)
+            'Bridge': (220, 220, 220),  # Gainsboro (neutral for bridges)
+            'Bouy': (255, 192, 203),  # Pink (neutral for buoys)
+            'Building': (205, 92, 92),  # Indian Red (represents buildings/structures)
+            'Lighthouse': (175, 238, 238)  # Pale Turquoise (represents lighthouses)
+        }
+        # Modify the loop to use the predefined colors
+        for mask in fastsam_results[0].masks.data:
+            mask_np = mask.cpu().numpy().astype(np.uint8) * 255
+            x, y, w, h = cv2.boundingRect(mask_np)
+            cropped = bgr_img[y:y+h, x:x+w]
+            if cropped.size == 0 or w < 10 or h < 10:
+                continue
+            pil_crop = Image.fromarray(cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB))
+            image_input = clip_preprocess(pil_crop).unsqueeze(0).to(device)
+            with torch.no_grad():
+                image_features = clip_model.encode_image(image_input)
+                image_features /= image_features.norm(dim=-1, keepdim=True)
+                similarity = (100.0 * image_features @ text_features.T).softmax(dim=-1)
+                best_idx = similarity[0].argmax().item()
+                best_score = similarity[0][best_idx].item()
+            # Keep track of used label positions to avoid collisions
+            used_positions = []
+            # Only annotate label if above CLIP threshold
+            if best_score >= clip_conf_threshold:
+                best_label = categories[best_idx]
+                # Determine the main category for the label
+                main_category = next((key for key, values in categories_dict.items() if best_label in values or best_label == key), None)
+                color = category_colors.get(main_category, (255, 255, 255))  # Default to white if not found
+                # Draw mask and label on combined image
+                colored_mask = cv2.merge([mask_np, mask_np, mask_np])
+                colored_mask = (colored_mask / 255.0) * np.array(color).reshape(1, 1, 3)
+                colored_mask = colored_mask.astype(np.uint8)
+                img_combined = cv2.addWeighted(img_combined, 1.0, colored_mask, 0.4, 0)
+                # Calculate the center of the bounding box
+                text_x = x + w // 2
+                text_y = y + h // 2
+                # Adjust label position to stay on screen and avoid collisions
+                (text_width, text_height), baseline = cv2.getTextSize(f'{best_label} ({best_score:.2f})',
+                                                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
+                text_x = max(0, min(text_x - text_width // 2, img_combined.shape[1] - text_width))  # Keep within horizontal bounds
+                text_y = max(text_height + 15, min(text_y, img_combined.shape[0] - 5))  # Keep within vertical bounds
+                # Check for collisions and adjust position if necessary
+                while any(abs(text_x - ux) < text_width and abs(text_y - uy) < text_height + baseline for ux, uy in used_positions):
+                    text_y += text_height + 15  # Move the label down to avoid overlap
+                # Save the position to avoid future collisions
+                used_positions.append((text_x, text_y))
+                # Draw the text with a black outline
+                cv2.putText(img_combined, f'{best_label} ({best_score:.2f})',
+                            (text_x, text_y),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                            (0, 0, 0),  # Black outline
+                            3)  # Thickness of the outline
+                # Draw the main text in white on top of the outline
+                cv2.putText(img_combined, f'{best_label} ({best_score:.2f})',
+                            (text_x, text_y),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                            color,  # White text
+                            1)  # Thickness of the main text
+        # ------------------- Show All Three -------------------
+        cv2.imshow(f"FastSAM + CLIP - Combined (Image {img_idx})", img_combined)
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()

@@ -1,0 +1,385 @@
+import matplotlib.pyplot as plt
+import os
+import cv2
+import torch
+import numpy as np
+from PIL import Image
+from ultralytics import FastSAM
+import clip
+
+# ------------------------------ Configuration ------------------------------
+class COMPASSConfig:
+    # initalization
+    IMG_FOLDER_PATH = './ExampleImgs'
+    FASTSAM_WEIGHTS = "FastSAM-s.pt"
+    CLIP_MODEL = "ViT-B/32"
+    
+    # image processing
+    IMG_RESIZE = 512    # resize input image size
+    SAM_CONF = 0.003      # confidence threshold for FastSAM
+    SAM_IOU = 0.2       # IoU threshold for Fast SAM
+    CLIP_CONF = 0       # hard confidence threshold for CLIP
+    CLIP_MULT = 0.0     # multiplier adjusting the best_score threhold (CLIP)
+
+    # display
+    MASK_ALPHA = 0.5                # opacity of masks
+    DISPLAY_CONTOURS = True         # display contours else display masks
+    DISPLAY_LABELS = True           # display labels else do not
+    DISPLAY_SUBCATEGORIES = True   # display sub categories else main ones
+    MOUSE_HOVER_MODE = True         # activate mouse hover mode else do not
+
+
+# ------------------------------ Pipeline ------------------------------
+class COMPASSPipeline:
+    # ---------------------------- Initialization ----------------------------
+    # initialize variables, models, and dictionary
+    def __init__(self, config):
+        # device and models
+        self.config = config
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.fastsam_model = FastSAM(config.FASTSAM_WEIGHTS)
+        self.clip_model, self.clip_preprocess = clip.load(config.CLIP_MODEL, device=self.device)
+
+        # categories and colors are loaded from a config file
+        from compass_wordbank import categories_dict, categories, category_colors
+        self.categories_dict = categories_dict
+        self.categories = categories
+        self.category_colors = category_colors
+
+        # mouse interaction
+        self.cursor_pos = (-1, -1)
+
+    # ---------------------------- Image Input ----------------------------
+    # read in images given a folder path
+    def load_images(self):
+        image_paths = [os.path.join(self.config.IMG_FOLDER_PATH, f) for f in os.listdir(self.config.IMG_FOLDER_PATH) if f.endswith('.png')]
+        return [cv2.imread(p) for p in image_paths]
+
+    # ---------------------------- Image Processing ----------------------------
+    # ---------------------------- Pre Model Processing ----------------------------
+    def clahe_filter(self, image, clipLimit=3.0, tileGridSize=(8, 8)):
+        lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+        clahe = cv2.createCLAHE(clipLimit=clipLimit, tileGridSize=tileGridSize)
+        lab[..., 0] = clahe.apply(lab[..., 0])
+        filtered_img = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+        
+        return filtered_img
+
+    # ---------------------------- Model Processing ----------------------------
+    # apply FastSAM model
+    def run_segmentation(self, image):
+        results = self.fastsam_model(
+            image,
+            device=self.device,
+            retina_masks=True,
+            imgsz=image.shape[:2],
+            conf=self.config.SAM_CONF,
+            iou=self.config.SAM_IOU,
+        )
+        return results[0].masks.data
+
+    # apply CLIP model
+    def run_text_association(self, image, masks):
+        # tuning variables
+        # calculate_best_label()
+        # # threshold_ratio
+        # combine_overlapping_masks()
+        # # overlap_range
+
+        # prepare CLIP text embeddings for categories
+        text_inputs = torch.cat([clip.tokenize(f"a photo of {category.lower()}") for category in self.categories]).to(self.device)
+        with torch.no_grad():
+            text_features = self.clip_model.encode_text(text_inputs)
+            text_features /= text_features.norm(dim=-1, keepdim=True)
+
+        # create array to store info about each mask
+        mask_info_list = []
+        # loop through each mask segment
+        for mask in masks:
+            mask_np = mask.cpu().numpy().astype(np.uint8) * 255
+            
+            # extract contours from segment
+            contours, _ = cv2.findContours(mask_np, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            # convert segments into bounding boxes
+            x, y, w, h = cv2.boundingRect(mask_np)
+            # skip empty or very small crops
+            if w < 10 or h < 10:
+                continue
+
+            # apply effect to background of segment's bounding box
+            mask_input = self.mask_background_effect(mask, image, effect_type='white')
+
+            # convert to PIL image for CLIP
+            pil_crop = Image.fromarray(cv2.cvtColor(mask_input, cv2.COLOR_BGR2RGB))
+            CLIP_img = self.clip_preprocess(pil_crop).unsqueeze(0).to(self.device)
+
+            # calculate similarity matrix
+            with torch.no_grad():
+                image_features = self.clip_model.encode_image(CLIP_img)
+                image_features /= image_features.norm(dim=-1, keepdim=True)
+                similarity = (100.0 * image_features @ text_features.T).softmax(dim=-1)
+
+            # calculate best label according to its score
+            label_info_list = self.calculate_best_label(similarity, calc_method='max')
+
+            med_score = similarity[0].median().item()
+            top_scores, top_indices = similarity[0].topk(5)
+
+            #print(f"{self.categories[best_idx]}: {best_score:.2f} (best score) {med_score:.2f} (med score)")
+            # skip masks that fall under the threshold
+            hard_cap = label_info_list['score'] >= self.config.CLIP_CONF
+            soft_cap = label_info_list['score'] >= med_score * self.config.CLIP_MULT
+
+            if hard_cap and soft_cap:
+                mask_info_list.append({
+                    'mask': mask_np,
+                    'contours': contours,
+                    'bbox': (x, y, w, h),
+
+                    'score': label_info_list['score'],
+                    'label': label_info_list['label'],
+                    'main_category': label_info_list['main_category'],
+                    'color': label_info_list['color']
+                })
+
+        return mask_info_list
+    
+    # applies an effect to the background given a segment mask
+    def mask_background_effect(self, mask, image, effect_type='none'):
+        mask_np = mask.cpu().numpy().astype(np.uint8) * 255
+
+        # convert segments into bounding boxes
+        x, y, w, h = cv2.boundingRect(mask_np)
+        cropped_img = image[y:y+h, x:x+w]
+
+        # turn cropped mask section into color
+        cropped_mask = mask_np[y:y+h, x:x+w]
+        mask_rgb = cv2.cvtColor(cropped_mask, cv2.COLOR_GRAY2BGR)
+        # apply background effect
+        effect_type = effect_type.lower()
+        if effect_type == 'white':
+            background = np.ones_like(cropped_img) * 255
+        elif effect_type == 'black':
+            background = np.zeros_like(cropped_img)
+        elif effect_type == 'blur':
+            background = cv2.GaussianBlur(cropped_img, (21, 21), 0)
+        elif effect_type == 'none':
+            background = cropped_img.copy()
+        else:
+            raise ValueError(f"Invalid effect_type value: '{self.config.MASK_FILL}'.")
+        # merge mask and background (with effect)
+        mask_input = np.where(mask_rgb > 0, cropped_img, background)
+
+        return mask_input
+    
+    def calculate_best_label(self, similarity, calc_method='max'):
+        # -------------------------- Helper --------------------------
+        def compute_main_category_means(threshold_ratio=0):
+            mean_scores = {}
+            for main_cat, subcats in self.categories_dict.items():
+                subcat_scores = [
+                    similarity[0][i].item()
+                    for i, subcat in enumerate(self.categories)
+                    if subcat in subcats
+                ]
+                if not subcat_scores:
+                    continue
+
+                # find max
+                max_score = max(subcat_scores)
+                threshold = max_score * threshold_ratio
+
+                # Keep scores that are >= threshold percentage of the max
+                filtered_scores = [s for s in subcat_scores if s >= threshold]
+
+                # Fallback to all if filtered is empty
+                if not filtered_scores:
+                    filtered_scores = subcat_scores
+
+                mean_scores[main_cat] = sum(filtered_scores) / len(filtered_scores)
+            return mean_scores
+        
+        # -------------------------- Main --------------------------
+        if calc_method == 'max':
+            best_idx = similarity[0].argmax().item()
+            best_score = similarity[0][best_idx].item()
+            best_label = self.categories[best_idx]
+            main_category = next((key for key, values in self.categories_dict.items() if best_label in values), best_label)
+
+        elif calc_method in {'mean_main', 'mean_weighted'}:
+            threshold_ratio = 0 if calc_method == 'mean_main' else 0.66
+            mean_scores = compute_main_category_means(threshold_ratio=threshold_ratio)
+            if not mean_scores:
+                raise ValueError("calculate_best_label(): All main category scores were filtered out.")
+            
+            main_category = max(mean_scores, key=mean_scores.get)
+            best_score = mean_scores[main_category]
+            sub_cat_indices = [
+                i for i, subcat in enumerate(self.categories)
+                if subcat in self.categories_dict[main_category]
+            ]
+            best_idx = max(sub_cat_indices, key=lambda i: similarity[0][i])
+            best_label = self.categories[best_idx]
+        
+        else:
+            raise ValueError(f"Invalid calc_method value: '{calc_method}'")
+
+        color = self.category_colors.get(main_category, (255, 255, 255))
+
+        return {
+            "score": best_score,
+            "label": best_label,
+            "main_category": main_category,
+            "color": color
+        }
+
+    # ---------------------------- Post Model Processing ----------------------------
+    def combine_overlapping_masks(self, mask_info_list):
+        merged = []
+        used = set()
+
+        for i, info_i in enumerate(mask_info_list):
+            if i in used:
+                continue
+
+            combined_mask = info_i['mask'].copy()
+            combined_bbox = list(info_i['bbox'])
+
+            for j, info_j in enumerate(mask_info_list):
+                if j == i or j in used:
+                    continue
+
+                mask_j = info_j['mask']
+
+                # calculate overlap between masks
+                overlap_range = 5 # number of pixels
+                kernel_range = 2*(overlap_range+1) + 1
+                dilated_mask = cv2.dilate(combined_mask, np.ones((kernel_range, kernel_range), np.uint8), iterations=1)
+                overlap = cv2.bitwise_and(dilated_mask, mask_j)
+
+                # check if masks meeting merging conditions:
+                # 1. a mask is completely overlapped by another
+                # 2. two masks belonging to the same main category that are also overlapping
+                check_completely_covered = np.all((combined_mask > 0)[mask_j > 0])
+                check_category_overlap = np.any(overlap) and info_i['main_category'] == info_j['main_category']
+                if check_completely_covered or check_category_overlap:
+                    combined_mask = cv2.bitwise_or(combined_mask, mask_j)
+                    used.add(j)
+                    x1_i, y1_i, w_i, h_i = combined_bbox
+                    x2_j, y2_j, w_j, h_j = info_j['bbox']
+                    x_min = min(x1_i, x2_j)
+                    y_min = min(y1_i, y2_j)
+                    x_max = max(x1_i + w_i, x2_j + w_j)
+                    y_max = max(y1_i + h_i, y2_j + h_j)
+                    combined_bbox = [x_min, y_min, x_max - x_min, y_max - y_min]
+
+            # remake contours
+            contours, _ = cv2.findContours(combined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            # update merge (essentially mask_info_list)
+            merged.append({
+                'mask': combined_mask,
+                'contours': contours,
+                'bbox': tuple(combined_bbox),
+                'label': info_i['label'],
+                'main_category': info_i['main_category'],
+                'score': info_i['score'],
+                'color': info_i['color']
+            })
+
+        return merged
+
+    # ---------------------------- Display ----------------------------
+    # helper function to display one mask with text
+    # info is the unit from mask_info_list
+    def display_mask(self, info, display_img):
+        # grab data from mask_info_list
+        mask_np = info['mask']
+        color = info['color']
+        label = info['label'] if self.config.DISPLAY_SUBCATEGORIES else info['main_category']
+        score = info['score']
+
+        # display contours or masks
+        if self.config.DISPLAY_CONTOURS:
+            cv2.drawContours(display_img, info['contours'], -1, color, 2)
+        else:
+            display_img[mask_np > 0] = (
+                display_img[mask_np > 0] * (1 - self.config.MASK_ALPHA) + np.array(color, dtype=np.float32) * self.config.MASK_ALPHA
+            ).astype(np.uint8)
+
+        # Draw label at center of mask bounding box
+        if self.config.DISPLAY_LABELS:
+            x, y, w, h = info['bbox']
+            text_x = x + w // 2
+            text_y = y + h // 2
+            cv2.putText(display_img, f'{label} ({score:.2f})', (text_x, text_y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3)
+            cv2.putText(display_img, f'{label} ({score:.2f})', (text_x, text_y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+
+        return display_img
+
+    # mouse interaction
+    def on_mouse(self, event, x, y, flags, param):
+        if event == cv2.EVENT_MOUSEMOVE:
+            self.cursor_pos = (x, y)
+
+    # overall display function
+    def display_results(self, image, mask_info_list):
+        img_copy = image.copy()
+
+        # set up mouse interaction
+        if self.config.MOUSE_HOVER_MODE:
+            cv2.namedWindow("Interactive View")
+            cv2.setMouseCallback("Interactive View", self.on_mouse)
+            
+            while True:
+                # reset display_img
+                display_img = img_copy.copy()
+
+                # check if cursor is within image bounds and over non-zero mask pixel
+                hovered_info = next((info for info in mask_info_list if
+                                     0 <= self.cursor_pos[0] < info['mask'].shape[1] and
+                                     0 <= self.cursor_pos[1] < info['mask'].shape[0] and
+                                     info['mask'][self.cursor_pos[1], self.cursor_pos[0]] > 0), None)
+                
+                # if cursor is over a mask, only display that mask
+                # if cursor is over no mask, display all masks
+                if hovered_info:
+                    display_img = self.display_mask(hovered_info, display_img)
+                else:
+                    for info in mask_info_list:
+                        display_img = self.display_mask(info, display_img)
+
+                cv2.imshow("Interactive View", display_img)
+                key = cv2.waitKey(1)
+                if key != -1:
+                    break
+            cv2.destroyAllWindows()
+        else:
+            # reset display_img
+            display_img = img_copy.copy()
+            for info in mask_info_list:
+                display_img = self.display_mask(info, display_img)
+
+            cv2.imshow("Static View", display_img)
+            cv2.waitKey(0)
+            cv2.destroyAllWindows()
+
+    # ---------------------------- Execution ----------------------------
+    # run full pipeline
+    def run(self):
+        images = self.load_images()
+        for image in images:
+            image = cv2.resize(image, (self.config.IMG_RESIZE, self.config.IMG_RESIZE))
+            #image = self.clahe_filter(image)
+            masks = self.run_segmentation(image)
+            mask_info_list = self.run_text_association(image, masks)
+            mask_info_list = self.combine_overlapping_masks(mask_info_list)
+            self.display_results(image, mask_info_list)
+
+# ------------------------------ Main ------------------------------
+if __name__ == "__main__":
+    config = COMPASSConfig()
+    pipeline = COMPASSPipeline(config)
+    pipeline.run()
