@@ -82,7 +82,7 @@ class clip_dinoiser_pipeline:
         # extract mask segments
         start = time.perf_counter()
         with torch.inference_mode():
-            output = self.model(img_tens).cpu()
+            output, dinoised_feats = self.model(img_tens, apply_softmax=False, get_features=True).cpu()
         elapsed = time.perf_counter() - start
         print(f'extract masks: {elapsed:.2f}s')
 
