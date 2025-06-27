@@ -4,18 +4,21 @@ import torch
 import cv2
 import time
 
+import importlib.resources as pkg_resources
+from omegaconf import OmegaConf
 from hydra import compose, initialize
 from PIL import Image
 import matplotlib.pyplot as plt
 from torchvision import transforms as T
 import torch.nn.functional as F
-from operator import itemgetter
 
 import clipdino_dictionary as dict
 
 from clip_dinoiser.models.builder import build_model
 from clip_dinoiser.segmentation.datasets.pascal_context import PascalContextDataset
 from clip_dinoiser.helpers.visualization import mask2rgb
+from clip_dinoiser import checkpoints
+import clip_dinoiser.resources as resources
 
 class clip_dinoiser_config:
     # init
@@ -28,7 +31,7 @@ class clip_dinoiser_config:
     WORD_BANK_NAME = 'extended'
 
     # tuning dials
-    IMG_RESIZE = 512
+    IMG_RESIZE = 256
 
 class clip_dinoiser_pipeline:
     # initialize variables
@@ -41,17 +44,14 @@ class clip_dinoiser_pipeline:
         print(self.device)
 
         # set up checkpoint
-        checkpoint = os.path.abspath(os.path.join(self.config.BASE_DIR, self.config.CHECKPOINT_PATH))
-        assert os.path.isfile(checkpoint), "Checkpoint file doesn't exist"
-        self.checkpoint = torch.load(checkpoint, map_location='cpu')
+        self.checkpoint = resources.load_checkpoint('last.pt')
 
         # initialize prompts
         self.prompts = dict.word_bank(self.config.WORD_BANK_NAME)
         self.palette = dict.get_label_colors(self.prompts)
 
         # initialize model
-        with initialize(config_path="clip_dinoiser/configs", version_base=None):
-            cfg = compose(config_name=self.config.CFG)
+        cfg = resources.load_config('clip_dinoiser.yaml')
         if len(self.prompts) == 1:
             self.prompts = ['background'] + self.prompts
         self.model = build_model(cfg.model, class_names=self.prompts)
@@ -82,7 +82,9 @@ class clip_dinoiser_pipeline:
         # extract mask segments
         start = time.perf_counter()
         with torch.inference_mode():
-            output, dinoised_feats = self.model(img_tens, apply_softmax=False, get_features=True).cpu()
+            output, dinoised_feats = self.model(img_tens, apply_softmax=False, get_features=True)
+            output = output.cpu()
+            dinoised_feats = dinoised_feats.cpu()
         elapsed = time.perf_counter() - start
         print(f'extract masks: {elapsed:.2f}s')
 
@@ -102,7 +104,8 @@ class clip_dinoiser_pipeline:
         fig = plt.figure()
         plt.imshow(mask)
         plt.axis('off')
-        plt.savefig(os.path.join('/home/sethknoop/COMPASS/Experiments/OutputImgs', f'{name}_output.png'), bbox_inches='tight', pad_inches=0)
+        save_path = os.path.join('./COMPASS/Experiments/OutputImgs', f'{name}_output.png')
+        plt.savefig(save_path, bbox_inches='tight', pad_inches=0)
         plt.close(fig)
     
     def display_labels(self):
@@ -117,7 +120,7 @@ class clip_dinoiser_pipeline:
         ax.set_title("Labels")
         plt.tight_layout()
 
-        save_path = os.path.join('/home/sethknoop/COMPASS/Experiments/OutputImgs', 'labels.png')
+        save_path = os.path.join('./COMPASS/Experiments/OutputImgs', 'labels.png')
         plt.savefig(save_path, bbox_inches='tight', pad_inches=0.1)
         plt.close(fig)
 
