@@ -41,7 +41,6 @@ class clip_dinoiser_pipeline:
 
         # initialize device
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(self.device)
 
         # set up checkpoint
         self.checkpoint = resources.load_checkpoint('last.pt')
@@ -70,14 +69,13 @@ class clip_dinoiser_pipeline:
 
     # process images and produce mask segments
     def produce_masks(self, image):
-
         # image loading and preprocessing
         img_pil = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
         w, h = img_pil.size
         img_pil = img_pil.resize((self.config.IMG_RESIZE,self.config.IMG_RESIZE))
 
         # create tensor based on image
-        img_tens = T.PILToTensor()(img_pil).unsqueeze(0).to(self.device) / 255.
+        img_tens = T.ToTensor()(img_pil).unsqueeze(0).to(self.device)
 
         # extract mask segments
         start = time.perf_counter()
@@ -104,7 +102,7 @@ class clip_dinoiser_pipeline:
         fig = plt.figure()
         plt.imshow(mask)
         plt.axis('off')
-        save_path = os.path.join('./COMPASS/Experiments/OutputImgs', f'{name}_output.png')
+        save_path = os.path.join('./OutputImgs', f'{name}_output.png')
         plt.savefig(save_path, bbox_inches='tight', pad_inches=0)
         plt.close(fig)
     
@@ -120,7 +118,7 @@ class clip_dinoiser_pipeline:
         ax.set_title("Labels")
         plt.tight_layout()
 
-        save_path = os.path.join('./COMPASS/Experiments/OutputImgs', 'labels.png')
+        save_path = os.path.join('./OutputImgs', 'labels.png')
         plt.savefig(save_path, bbox_inches='tight', pad_inches=0.1)
         plt.close(fig)
 
