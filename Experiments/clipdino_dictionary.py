@@ -7,7 +7,8 @@ WORD_BANKS = {
                  'tree', 'bush', 'grass',
                  'rock',
                  'dock', 'boat', 'buoy',
-                 'building', 'wall', 'pole', 'car']
+                 'building', 'wall', 'pole', 'car'],
+    'single': ['boat']
 }
 
 LABEL_COLOR_MAP = {
@@ -28,7 +29,9 @@ LABEL_COLOR_MAP = {
     'building': (235,192,66),
     'wall': (129,118,75),
     'pole': (156,134,94),
-    'car': (235,137,50)
+    'car': (235,137,50),
+
+    'background': (0, 0, 0)
 }
 
 def word_bank(name):

@@ -26,12 +26,12 @@ class clip_dinoiser_config:
     IMG_FOLDER_PATH = '../ExampleImgs'
     
     # model setup
-    CFG = 'clip_dinoiser.yaml'
+    CFG = 'COMPASS.yaml'
     CHECKPOINT_PATH = 'clip_dinoiser/checkpoints/last.pt'
     WORD_BANK_NAME = 'extended'
 
     # tuning dials
-    IMG_RESIZE = 256
+    IMG_RESIZE = 1280
 
 class clip_dinoiser_pipeline:
     # initialize variables
@@ -47,12 +47,12 @@ class clip_dinoiser_pipeline:
 
         # initialize prompts
         self.prompts = dict.word_bank(self.config.WORD_BANK_NAME)
+        if len(self.prompts) == 1:
+            self.prompts = ['background'] + self.prompts
         self.palette = dict.get_label_colors(self.prompts)
 
         # initialize model
-        cfg = resources.load_config('clip_dinoiser.yaml')
-        if len(self.prompts) == 1:
-            self.prompts = ['background'] + self.prompts
+        cfg = resources.load_config(self.config.CFG)
         self.model = build_model(cfg.model, class_names=self.prompts)
         self.model.load_state_dict(self.checkpoint['model_state_dict'], strict=False)
         self.model.eval()
@@ -68,11 +68,12 @@ class clip_dinoiser_pipeline:
         return [(cv2.imread(p), os.path.basename(p)) for p in image_paths]
 
     # process images and produce mask segments
-    def produce_masks(self, image):
+    def produce_masks(self, image, display_soft_edges=True):
         # image loading and preprocessing
         img_pil = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
         w, h = img_pil.size
-        img_pil = img_pil.resize((self.config.IMG_RESIZE,self.config.IMG_RESIZE))
+        img_resize = self.config.IMG_RESIZE
+        img_pil = img_pil.resize((img_resize, img_resize))
 
         # create tensor based on image
         img_tens = T.ToTensor()(img_pil).unsqueeze(0).to(self.device)
@@ -87,8 +88,11 @@ class clip_dinoiser_pipeline:
         print(f'extract masks: {elapsed:.2f}s')
 
         # resize tensor to fit original image dimensions
-        output = F.interpolate(output, size=(h,w), mode="bilinear",
-                            align_corners=False)[..., :h, :w]
+        if display_soft_edges:
+            output = F.interpolate(output, scale_factor=self.model.vit_patch_size, mode="bilinear",
+                                   align_corners=False)[..., :h, :w]
+        else:
+                output = F.interpolate(output, size=(h,w), mode="nearest")
 
         # select the class with the highest score for each pixel
         output = output[0].argmax(dim=0)
@@ -105,7 +109,7 @@ class clip_dinoiser_pipeline:
         save_path = os.path.join('./OutputImgs', f'{name}_output.png')
         plt.savefig(save_path, bbox_inches='tight', pad_inches=0)
         plt.close(fig)
-    
+
     def display_labels(self):
         n = len(self.prompts)
         palette_array = np.array(self.palette).reshape(1, n, 3) / 255.0  # normalize colors for matplotlib
@@ -122,14 +126,14 @@ class clip_dinoiser_pipeline:
         plt.savefig(save_path, bbox_inches='tight', pad_inches=0.1)
         plt.close(fig)
 
-    def run(self):
+    def run(self, img_resize):
         images = self.load_images()
         for image, filename in images:
-            masks = self.produce_masks(image)
+            masks = self.produce_masks(image, display_soft_edges=False)
             self.display_results(masks, filename)
         self.display_labels()
 
 if __name__ == '__main__':
     config = clip_dinoiser_config()
     pipeline = clip_dinoiser_pipeline(config)
-    pipeline.run()
+    pipeline.run(1280)
