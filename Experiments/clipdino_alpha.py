@@ -12,7 +12,7 @@ import matplotlib.pyplot as plt
 from torchvision import transforms as T
 import torch.nn.functional as F
 
-import clipdino_dictionary as dict
+import input_dictionary as dict
 
 from clip_dinoiser.models.builder import build_model
 from clip_dinoiser.segmentation.datasets.pascal_context import PascalContextDataset
@@ -46,7 +46,7 @@ class clip_dinoiser_pipeline:
         self.checkpoint = resources.load_checkpoint('last.pt')
 
         # initialize prompts
-        self.prompts = dict.word_bank(self.config.WORD_BANK_NAME)
+        self.prompts = dict.word_bank('clipdino', self.config.WORD_BANK_NAME)
         if len(self.prompts) == 1:
             self.prompts = ['background'] + self.prompts
         self.palette = dict.get_label_colors(self.prompts)

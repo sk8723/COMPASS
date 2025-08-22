@@ -32,7 +32,7 @@ categories = [item for sublist in categories_dict.values() for item in sublist]
 
 category_colors = {
     'Water Surface': (255, 0, 0),          # Blue
-    'Tree': (0, 128, 0),             # Green
+    'Tree': (0, 128, 0),                   # Green
     'Boat': (0, 0, 255),                   # Red
     'Boat parts': (0, 255, 255),           # Yellow
     'Rock': (128, 128, 128),               # Gray

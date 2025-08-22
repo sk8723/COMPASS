@@ -2,14 +2,25 @@ import numpy as np
 from matplotlib import cm
 
 WORD_BANKS = {
-    'basic': ['sky', 'building', 'water', 'ground', 'tree', 'boat'],
-    'extended': ['water', 'sky', 'ground',
-                 'tree', 'bush', 'grass',
-                 'rock',
-                 'dock', 'boat', 'buoy',
-                 'building', 'wall', 'pole', 'car'],
-    'single': ['boat']
+    'clipdino': {
+        'basic': ['sky', 'building', 'water', 'ground', 'tree', 'boat'],
+        'extended': ['water', 'sky', 'ground',
+                     'tree', 'bush', 'grass',
+                     'rock',
+                     'dock', 'boat', 'buoy',
+                     'building', 'wall', 'pole', 'car'],
+        'single': ['boat']
+    },
+    'gdino': {
+        'basic': 'sky . building . water . ground . tree . boat',
+        'extended': 'water . sky . ground . \
+                    tree . bush . grass . \
+                    rock . \
+                    dock . boat . buoy . \
+                    building . wall . pole . car'
+    }
 }
+
 
 LABEL_COLOR_MAP = {
     'water': (48,128,240),
@@ -34,8 +45,12 @@ LABEL_COLOR_MAP = {
     'background': (0, 0, 0)
 }
 
-def word_bank(name):
-    return WORD_BANKS.get(name, WORD_BANKS['basic'])
+def word_bank(model, name):
+    """
+    Retrieve a word bank for a specific model type ('clipdino', 'gdino') and name.
+    Defaults to CLIP-DINO 'basic' if not found.
+    """
+    return WORD_BANKS.get(model, {}).get(name, WORD_BANKS['clipdino']['basic'])
 
 # generate 'n' distinct colors
 def get_default_colors(n):
