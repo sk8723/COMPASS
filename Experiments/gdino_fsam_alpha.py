@@ -11,7 +11,7 @@ import importlib.resources as pkg_resources
 import json
 import gc
 
-import input_dictionary as dict
+from . import input_dictionary as dict
 
 import groundingdino.datasets.transforms as T
 from groundingdino.models import build_model
@@ -29,7 +29,7 @@ class GroundingDINOConfig:
     
     # tuning dials
     BOX_THRESHOLD = 0.3
-    TEXT_THRESHOLD = 0.25
+    TEXT_THRESHOLD = 0.3
     IMG_RESIZE = 2000
 
     CPU_ONLY = False
@@ -68,6 +68,8 @@ class GroundingDINOPipeline:
         ])
         image_tensor, _ = transform(image_pil, None)
         
+        # prompts preparation
+        prompts = " . ".join(prompts)
         prompts = prompts.strip().lower()
         if not prompts.endswith("."):
             prompts += "."
@@ -119,7 +121,7 @@ class FastSAMPipeline:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.model = FastSAM(config.MODEL_PATH)
 
-    def produce_masks(self, image, filename, out_path):
+    def produce_masks(self, image):
         with torch.inference_mode():
             everything_results = self.model(
                 image,
@@ -142,25 +144,25 @@ class FastSAMPipeline:
 class MainConfig:
     # input/output
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-    IMAGE_PATH = "../ExampleImgs"
-    WORD_BANK_NAME = "extended"
-
     OUTPUT_DIR = "../../OutputImgs"
 
 class MainPipeline:
-    def __init__(self, config, gdino_config, fsam_config):
+    def __init__(self, config, gdino_config, fsam_config, prompts):
         self.config = config
         self.gdino_pipeline = GroundingDINOPipeline(gdino_config)
         self.fsam_pipeline = FastSAMPipeline(fsam_config)
 
+        if isinstance(prompts, str):
+            prompts = dict.word_bank(prompts)
+        self.prompts = prompts
+
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        self.img_path = os.path.abspath(os.path.join(self.config.BASE_DIR, self.config.IMAGE_PATH))
         self.out_path = os.path.abspath(os.path.join(self.config.BASE_DIR, self.config.OUTPUT_DIR))
-        self.prompts = dict.word_bank('gdino', self.config.WORD_BANK_NAME)
 
-    def load_images(self):
-        image_paths = [os.path.join(self.img_path, f) for f in os.listdir(self.img_path) if f.endswith('.png')]
+    def load_images(self, folder_path):
+        abs_folder_path = os.path.abspath(os.path.join(self.config.BASE_DIR, folder_path))
+        image_paths = [os.path.join(abs_folder_path, f) for f in os.listdir(abs_folder_path) if f.endswith('.png')]
         return [(cv2.imread(p), os.path.basename(p)) for p in image_paths]
     
     def match_boxes_and_masks(self, boxes, masks):
@@ -236,9 +238,15 @@ class MainPipeline:
 
         return matched_masks
 
-    def display_results(self, image, masks, labels, scores):
+    def display_results(self, image, masks, labels, scores=None):
         # Display and save results
         vis_image = image.copy()
+
+        # option of displaying scores
+        if scores is None:
+            scores = [None] * len(labels)
+
+        # loop through each mask
         for mask, label, score in zip(masks, labels, scores):
             if mask is None:
                 continue
@@ -260,7 +268,10 @@ class MainPipeline:
                 y_center = int(np.mean(y_indices))
                 x_center = int(np.mean(x_indices))
                 
-                text = f"{label} ({score:.2f})"
+                if score is not None:
+                    text = f"{label} ({score:.2f})"
+                else:
+                    text = f"{label}"
                 font = cv2.FONT_HERSHEY_SIMPLEX
                 font_scale = 1
                 thickness = 2
@@ -282,48 +293,81 @@ class MainPipeline:
                 )
 
         return vis_image
+    
+    # type is a string
+    # image is a NumPy array
+    # prompts is an array of strings or single string in reference to a word bank
+    # folder_name is a string
+    def run(self, image_arr=None, folder_path=None, save_images=False, type='debugging'):
+        # parameter format evaluation
+        if image_arr is not None and folder_path is not None:
+            raise ValueError("either a single image or folder of images must be provided, not both")
 
-    def run(self):
-        images = self.load_images()
+        # simplify variable names
+        fsam = self.fsam_pipeline
+        gdino = self.gdino_pipeline
+        prompts = self.prompts
 
-        total_fsam_time = 0
+        # format images
+        if folder_path is not None:
+            images = self.load_images(folder_path)
+        else:
+            images = [(image_arr, "singleshot")]
+
+        # run primary processing loop
+        out_masks = [] # masks to be outputted
         for image, filename in images:
-            # start timer
-            start = time.perf_counter()
-
             # run Grounding DINO and FastSAM models
-            boxes, labels, scores = self.gdino_pipeline.produce_boxes(image, self.prompts)
-            gdino_elapsed = time.perf_counter() - start
+            boxes, labels, scores = gdino.produce_boxes(image, prompts)
+            masks = fsam.produce_masks(image)
 
-            masks = self.fsam_pipeline.produce_masks(image, filename, self.out_path)
-            fsam_elapsed = time.perf_counter() - start - gdino_elapsed
-            total_fsam_time += fsam_elapsed
-
+            # match GDINO boxes to FSAM masks
             matched_masks = self.match_boxes_and_masks(boxes, masks)
 
-            # create image
-            vis_image = self.display_results(image, matched_masks, labels, scores)
+            # match masks to labels
+            H, W = image.shape[:2]
+            pred_masks = [np.zeros((H, W), dtype=bool) for _ in prompts]
+            for label, mask in zip(labels, matched_masks):
+                if mask is None:
+                    continue
+                label = label.strip().lower()
+                if label in prompts:
+                    idx = prompts.index(label)
+                    pred_masks[idx] = np.logical_or(pred_masks[idx], mask)
+            out_masks.append(pred_masks)
 
-            # Save image
-            name = os.path.splitext(filename)[0]  # strip ".png" extension
-            out_file = os.path.join(self.out_path, f"{name}_output.png")
-            cv2.imwrite(out_file, vis_image)
+            # save images
+            if save_images:
+                vis_image = None
+                if type == 'debugging':
+                    # create image
+                    vis_image = self.display_results(image, matched_masks, labels, scores=scores)
+
+                if type == 'evaluation':
+                    # create image
+                    vis_image = self.display_results(image, pred_masks, prompts)
+
+                if vis_image is None:
+                    raise ValueError("unrecognized value for 'type'")
+
+                # Save image
+                name = os.path.splitext(filename)[0]  # strip ".png" extension
+                out_file = os.path.join(self.out_path, f"{name}_output.png")
+                cv2.imwrite(out_file, vis_image)
             
+            # deallocate big data
             del boxes
             del labels
             del scores
             del masks
             torch.cuda.empty_cache()
             gc.collect()
-            
-            # stop timer
-            print(f'{filename} processing time: {gdino_elapsed:.2f}s (GDINO) + {fsam_elapsed:.2f}s (FSAM) = {(gdino_elapsed + fsam_elapsed):.2f}s')
-        print(f'average fsam time: {(total_fsam_time/5):.2f}')
+        
+        return out_masks
 
-if __name__ == "__main__":
+def load_model(prompts):
     gdino_config = GroundingDINOConfig()
     fsam_config = FastSAMConfig()
-
     main_config = MainConfig()
-    main_pipeline = MainPipeline(main_config, gdino_config, fsam_config)
-    main_pipeline.run()
+    main_pipeline = MainPipeline(main_config, gdino_config, fsam_config, prompts)
+    return main_pipeline

@@ -45,7 +45,7 @@ class GroundingDINOPipeline:
         self.device = "cpu" if config.CPU_ONLY else "cuda"
         self.model = self.load_model()
         self.img_path = os.path.abspath(os.path.join(self.config.BASE_DIR, self.config.IMAGE_PATH))
-        self.prompts = dict.word_bank('gdino', self.config.WORD_BANK_NAME)
+        self.prompts = " . ".join(dict.word_bank(self.config.WORD_BANK_NAME))
 
     def load_model(self):
         # Load config file as a path

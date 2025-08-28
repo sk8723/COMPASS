@@ -2,7 +2,6 @@ import os
 import numpy as np
 import torch
 import cv2
-import time
 
 import importlib.resources as pkg_resources
 from omegaconf import OmegaConf
@@ -12,7 +11,7 @@ import matplotlib.pyplot as plt
 from torchvision import transforms as T
 import torch.nn.functional as F
 
-import input_dictionary as dict
+from . import input_dictionary as dict
 
 from clip_dinoiser.models.builder import build_model
 from clip_dinoiser.segmentation.datasets.pascal_context import PascalContextDataset
@@ -26,16 +25,15 @@ class clip_dinoiser_config:
     IMG_FOLDER_PATH = '../ExampleImgs'
     
     # model setup
-    CFG = 'COMPASS.yaml'
+    CONFIG_NAME = 'COMPASS.yaml'
     CHECKPOINT_PATH = 'clip_dinoiser/checkpoints/last.pt'
-    WORD_BANK_NAME = 'extended'
 
     # tuning dials
     IMG_RESIZE = 1280
 
 class clip_dinoiser_pipeline:
     # initialize variables
-    def __init__(self, config):
+    def __init__(self, config, prompts):
         # copy over config
         self.config = config
 
@@ -46,25 +44,25 @@ class clip_dinoiser_pipeline:
         self.checkpoint = resources.load_checkpoint('last.pt')
 
         # initialize prompts
-        self.prompts = dict.word_bank('clipdino', self.config.WORD_BANK_NAME)
-        if len(self.prompts) == 1:
-            self.prompts = ['background'] + self.prompts
-        self.palette = dict.get_label_colors(self.prompts)
+        if isinstance(prompts, str):
+            prompts = dict.word_bank(prompts)
+        if len(prompts) == 1:
+            prompts = ['background'] + prompts
+        self.palette = dict.get_label_colors(prompts)
+        self.prompts = prompts
 
         # initialize model
-        cfg = resources.load_config(self.config.CFG)
+        cfg = resources.load_config(self.config.CONFIG_NAME)
         self.model = build_model(cfg.model, class_names=self.prompts)
         self.model.load_state_dict(self.checkpoint['model_state_dict'], strict=False)
         self.model.eval()
         self.model.to(self.device)
         self.model.apply_found = 'background' in self.prompts
 
-        # set up image folder path
-        self.img_path = os.path.abspath(os.path.join(self.config.BASE_DIR, self.config.IMG_FOLDER_PATH))
-
     # read in images given a folder path
-    def load_images(self):
-        image_paths = [os.path.join(self.img_path, f) for f in os.listdir(self.img_path) if f.endswith('.png')]
+    def load_images(self, folder_path):
+        abs_folder_path = os.path.abspath(os.path.join(self.config.BASE_DIR, folder_path))
+        image_paths = [os.path.join(abs_folder_path, f) for f in os.listdir(abs_folder_path) if f.endswith('.png')]
         return [(cv2.imread(p), os.path.basename(p)) for p in image_paths]
 
     # process images and produce mask segments
@@ -79,20 +77,16 @@ class clip_dinoiser_pipeline:
         img_tens = T.ToTensor()(img_pil).unsqueeze(0).to(self.device)
 
         # extract mask segments
-        start = time.perf_counter()
         with torch.inference_mode():
             output, dinoised_feats = self.model(img_tens, apply_softmax=False, get_features=True)
             output = output.cpu()
             dinoised_feats = dinoised_feats.cpu()
-        elapsed = time.perf_counter() - start
-        print(f'extract masks: {elapsed:.2f}s')
 
         # resize tensor to fit original image dimensions
         if display_soft_edges:
-            output = F.interpolate(output, scale_factor=self.model.vit_patch_size, mode="bilinear",
-                                   align_corners=False)[..., :h, :w]
+            output = F.interpolate(output, size=(h, w), mode="bilinear", align_corners=False)
         else:
-                output = F.interpolate(output, size=(h,w), mode="nearest")
+            output = F.interpolate(output, size=(h,w), mode="nearest")
 
         # select the class with the highest score for each pixel
         output = output[0].argmax(dim=0)
@@ -126,14 +120,45 @@ class clip_dinoiser_pipeline:
         plt.savefig(save_path, bbox_inches='tight', pad_inches=0.1)
         plt.close(fig)
 
-    def run(self, img_resize):
-        images = self.load_images()
+    def run(self, image_arr=None, folder_path=None, save_images=False):
+        # parameter format evaluation        
+        if image_arr is not None and folder_path is not None:
+            raise ValueError("either a single image or folder of images must be provided, not both")
+
+        # format images
+        out_masks = [] # masks to be outputted
+        if folder_path is not None:
+            images = self.load_images(folder_path)
+        else:
+            images = [(image_arr, "singleshot")]
+        
+        # run primary processing loop
         for image, filename in images:
-            masks = self.produce_masks(image, display_soft_edges=False)
-            self.display_results(masks, filename)
-        self.display_labels()
+            # run CLIP DINOiser model
+            masks = self.produce_masks(image, display_soft_edges=True)
+
+            pred_masks = []
+            for class_id in range(len(self.prompts)):
+                pred_mask = (masks == class_id).numpy().astype(bool)
+                pred_masks.append(pred_mask)
+            out_masks.append(pred_masks)
+
+            # save images
+            if save_images:
+                self.display_results(masks, filename)
+        
+        # save labels (only once)
+        if save_images:
+            self.display_labels()
+
+        return out_masks
+
+def load_model(prompts):
+    config = clip_dinoiser_config()
+    pipeline = clip_dinoiser_pipeline(config, prompts)
+    return pipeline
 
 if __name__ == '__main__':
     config = clip_dinoiser_config()
     pipeline = clip_dinoiser_pipeline(config)
-    pipeline.run(1280)
+    pipeline.run()
